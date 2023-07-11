@@ -1,0 +1,133 @@
+#!/bin/bash
+#
+# Run the same code from SQL diagnostic bundle(s) against multiple CRDB versions
+
+# Uncomment to trace:
+# set -x
+
+### DIRECTIONS ###
+
+# 1a. Put CRDB release directories under a single parent directory
+# 1b. Specify that parent directory
+CRDB_RELEASES_ROOT_DIR=~/releases
+
+# 2. Specify CRDB versions to run, using the above release directory names, one per line
+CRDB_VERSIONS="
+    cockroach-v21.1.12.darwin-10.9-amd64
+    cockroach-v21.2.2.darwin-10.9-amd64
+"
+
+# 3a. Uncompress one or more statement diagnostic bundles under a single parent directory
+# 3b. Specify that parent directory
+DIAGNOSTIC_BUNDLES_ROOT=~/Documents/AAA_customers/Best_Buy/issues/10247_Questions_on_a_DELETE_statement_and_execution_plan_and_intents/SendSafely_download_08KA-M6DK
+
+# 4. Specify the database name from the statement diagnostic bundle(s)
+CRDB_DB=orderreceived
+
+# 5. Specify the schema-creation SQL file relative to DIAGNOSTIC_BUNDLES_ROOT
+#    or empty string to skip schema creation
+SCHEMA_CREATION_SQL_FILE=stmt-bundle-704019465098231813/schema.sql
+
+# 6. Specify the table statistics SQL file relative to DIAGNOSTIC_BUNDLES_ROOT
+#    or empty string to skip loading table statistics
+TABLE_STATISTICS_SQL_FILE=stmt-bundle-704019465098231813/stats-orderreceived.public.order_update.sql
+
+# 7. Specify the query SQL file as QUERY_SQL_FILE relative to DIAGNOSTIC_BUNDLES_ROOT
+#    or empty string to skip running the query
+QUERY_SQL_FILE=stmt-bundle-704019178915332101/statement_UPDATED.txt
+
+# 8. Decide whether to disable automatic statistics collection ("YES" or "NO")
+#    (You probably want this to be YES, because otherwise automatic statistics updating
+#    may undo the statistics that were manually loaded previously.  This seems to
+#    happen around 40 seconds after the statistics are manually loaded.)
+DISABLE_AUTO_TABLE_STATS=YES
+
+# 9. Specify the number of seconds to sleep after loading table statistics
+STATS_SLEEP_SECONDS=0
+
+# 10. Specify how many times to run the SQL query (for each CRDB release)
+QUERY_ITERATIONS=1
+
+# 11. Specify how many seconds to sleep between SQL query executions
+QUERY_SLEEP_SECONDS=0
+
+### END OF DIRECTIONS ###
+
+
+PATH_ORIGINAL=$PATH
+AA=$(basename $0):
+
+for CRDB_VERSION in $CRDB_VERSIONS; do
+    echo
+    echo
+    echo ======================================================================================
+    echo CockroachDB version: $CRDB_VERSION
+    echo ======================================================================================
+    echo
+    CRDB_DIR=$CRDB_RELEASES_ROOT_DIR/$CRDB_VERSION
+    PATH=$CRDB_DIR:$PATH_ORIGINAL
+    cockroach start-single-node --insecure --listen-addr=localhost:26257 --http-addr=localhost:8080 --pid-file=pid_file.txt --background
+    sleep 3    # not strictly necessary since --background makes control return after CRDB is ready to take connections
+
+    # Verify the CRDB version
+    cockroach sql --insecure -e "show session crdb_version;"
+
+    echo $AA Creating the database $CRDB_DB
+    cockroach sql --insecure -e "create database $CRDB_DB;"
+
+    if [ "$DISABLE_AUTO_TABLE_STATS" = "YES" ]; then
+        echo $AA Turning off automatic table statistics collection
+        cockroach sql --insecure -e "SET CLUSTER SETTING sql.stats.automatic_collection.enabled = false;"
+    else
+        echo $AA Leaving on default automatic table statistics creation
+    fi
+
+    if [ "$SCHEMA_CREATION_SQL_FILE" != "" ]; then
+        echo $AA Creating the schema
+        cockroach sql --insecure -d $CRDB_DB -f $DIAGNOSTIC_BUNDLES_ROOT/$SCHEMA_CREATION_SQL_FILE
+    else
+        echo $AA Skipping creating the schema
+    fi
+
+    if [ "$TABLE_STATISTICS_SQL_FILE" != "" ]; then
+        echo $AA Loading the table statistics
+        cockroach sql --insecure -d $CRDB_DB -f $DIAGNOSTIC_BUNDLES_ROOT/$TABLE_STATISTICS_SQL_FILE
+    else
+        echo $AA Skipping loading the table statistics
+    fi
+
+    if [[ $STATS_SLEEP_SECONDS>0 ]]; then
+        echo $AA Table statistics loaded, now sleeping $STATS_SLEEP_SECONDS seconds...
+        sleep $STATS_SLEEP_SECONDS
+    fi
+
+    for ((ITERATION=1; ITERATION<=QUERY_ITERATIONS; ITERATION++)); do    
+        if [ "$QUERY_SQL_FILE" != "" ]; then
+            echo $AA Running the query - iteration $ITERATION
+            cockroach sql --insecure -d $CRDB_DB -f $DIAGNOSTIC_BUNDLES_ROOT/$QUERY_SQL_FILE
+        else
+            echo $AA Skipping running the query
+        fi
+
+        if [[ $QUERY_SLEEP_SECONDS>0 && $ITERATION<$QUERY_ITERATIONS ]]; then
+            echo $AA Sleeping $QUERY_SLEEP_SECONDS seconds...
+            sleep $QUERY_SLEEP_SECONDS
+        fi
+    done
+
+    echo $AA Shutting down CockroachDB
+    # This works but using PID file now because that is better:
+    # ps aux | grep "cockroach start-single-node" | grep -v grep | sed 's/  */ /g' | cut -d ' ' -f 2 | xargs kill
+    CRDB_PID=$(cat pid_file.txt)
+    kill $CRDB_PID
+    rm pid_file.txt
+    KILL_SLEEP_SECONDS=5
+    echo $AA Killed PID $CRDB_PID, now sleeping $KILL_SLEEP_SECONDS seconds...
+    sleep $KILL_SLEEP_SECONDS
+
+    # Save CockroachDB data dir for later manual debugging if desired
+    TEMPFILE=$(mktemp $PWD/cockroach-data_RENAMED_$CRDB_VERSION.XXXXXXXX)
+    echo $AA Moving CockroachDB data directory to $TEMPFILE
+    rm $TEMPFILE
+    mv -i cockroach-data $TEMPFILE
+done
